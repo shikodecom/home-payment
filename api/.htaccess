@@ -1,0 +1,9 @@
+Options -Indexes
+SetEnv APP_CONFIG_PATH /home/f-taniguchi/private/home-payment.env
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [QSA,L]
+
+<FilesMatch "^\.">
+  Require all denied
+</FilesMatch>

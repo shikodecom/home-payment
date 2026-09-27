@@ -1,0 +1,9 @@
+-- 手動ロールバック用。自動実行禁止。
+-- 必ず mysqldump で対象テーブルをバックアップし、外部キー順を確認してから実行してください。
+-- DROP TABLEを実行するとクラウドデータは失われます。
+--
+-- SET FOREIGN_KEY_CHECKS=0;
+-- DROP TABLE IF EXISTS api_rate_limits, user_settings, archive_batch_payments,
+--   payments, archive_batches, auth_login_attempts, user_sessions,
+--   auth_identities, users;
+-- SET FOREIGN_KEY_CHECKS=1;

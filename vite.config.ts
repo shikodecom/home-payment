@@ -1,0 +1,6 @@
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import { VitePWA } from 'vite-plugin-pwa'
+
+const icon='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#E86F51"/><rect x="105" y="80" width="302" height="352" rx="38" fill="#FFF8EF"/><path d="M165 177h182M165 246h145M165 315h96" stroke="#343A36" stroke-width="25" stroke-linecap="round"/><circle cx="347" cy="338" r="61" fill="#F5B544"/><path d="m321 339 18 18 36-42" fill="none" stroke="#343A36" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+export default defineConfig({base:'/tools/home-payment/',publicDir:false,plugins:[react(),{name:'app-icon',generateBundle(){this.emitFile({type:'asset',fileName:'icon.svg',source:icon})}},VitePWA({registerType:'autoUpdate',manifest:{name:'家計の支払めも',short_name:'支払めも',description:'払ったときに、すぐ残す。',lang:'ja',theme_color:'#e86f51',background_color:'#fffaf4',display:'standalone',start_url:'./',scope:'./',icons:[{src:'icon.svg',sizes:'any',type:'image/svg+xml',purpose:'any maskable'}]},workbox:{globPatterns:['**/*.{js,css,html,svg}'],navigateFallbackDenylist:[/^\/tools\/home-payment\/api(?:\/|$)/]}})]})
