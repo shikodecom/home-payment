@@ -31,6 +31,15 @@ $requirements = [
     'user_id=?' => 'user-scoped queries',
     'deleted_at IS NOT NULL' => 'idempotent payment deletion',
     'PDO::ATTR_EMULATE_PREPARES => false' => 'native prepared statements',
+    "'sessionRefreshThreshold'" => 'rolling session threshold',
+    "expires_at=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? SECOND)" => 'rolling session expiry',
+    "'path' => \$this->config['cookiePath']" => 'application cookie path',
+    "\$this->config['csrfCookie']" => 'configurable CSRF cookie',
+    'session_cookie_missing' => 'missing session diagnostic',
+    'session_not_found' => 'unknown session diagnostic',
+    'session_expired' => 'expired session diagnostic',
+    'session_revoked' => 'revoked session diagnostic',
+    'auth_db_error' => 'session database diagnostic',
 ];
 
 $failed = [];

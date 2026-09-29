@@ -51,6 +51,7 @@ export interface StoredData {
 export type BillingChoice = 'household' | 'self' | 'other' | 'unset'
 export type StorageMode = 'local' | 'cloud'
 export type SyncState = 'synced' | 'syncing' | 'pending' | 'failed'
+export type AuthStatus = 'checking' | 'authenticated' | 'unauthenticated' | 'unavailable'
 
 export interface AuthUser {
   id: string
@@ -60,8 +61,10 @@ export interface AuthUser {
 }
 
 export interface AuthState {
+  status: AuthStatus
   authenticated: boolean
   storageMode: StorageMode
+  pendingResume?: boolean
   user?: AuthUser
   csrfToken?: string
 }

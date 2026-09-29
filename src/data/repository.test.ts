@@ -1,5 +1,5 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {cloudToStored, LocalPaymentRepository, loginUrl, resumePendingLogin} from './repository'
+import {cloudToStored, fetchAuth, fetchAuthWithResume, LocalPaymentRepository, loginUrl, resumePendingLogin} from './repository'
 import {migrateStoredData} from '../logic'
 
 class MemoryStorage {
@@ -57,7 +57,7 @@ describe('iPhoneホーム画面のログイン復帰', () => {
     ))
     vi.stubGlobal('fetch', fetchMock)
 
-    await expect(resumePendingLogin()).resolves.toBe(true)
+    await expect(resumePendingLogin()).resolves.toBe('completed')
     expect(localStorage.getItem('paymentApp.loginResume.v1')).toBeNull()
     expect(fetchMock).toHaveBeenCalledWith(
       '/tools/home-payment/api/auth/line/resume',
@@ -69,7 +69,53 @@ describe('iPhoneホーム画面のログイン復帰', () => {
     localStorage.setItem('paymentApp.loginResume.v1', 'b'.repeat(43))
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', {status: 202})))
 
-    await expect(resumePendingLogin()).resolves.toBe(false)
+    await expect(resumePendingLogin()).resolves.toBe('pending')
     expect(localStorage.getItem('paymentApp.loginResume.v1')).toBe('b'.repeat(43))
+  })
+
+  it.each([401, 410, 422])('無効な復帰キーは %i で削除する', async status => {
+    localStorage.setItem('paymentApp.loginResume.v1', 'c'.repeat(43))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', {status})))
+    await expect(resumePendingLogin()).resolves.toBe('invalid')
+    expect(localStorage.getItem('paymentApp.loginResume.v1')).toBeNull()
+  })
+
+  it('一時的な障害では復帰キーを保持する', async () => {
+    localStorage.setItem('paymentApp.loginResume.v1', 'd'.repeat(43))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', {status: 500})))
+    await expect(resumePendingLogin()).resolves.toBe('unavailable')
+    expect(localStorage.getItem('paymentApp.loginResume.v1')).toBe('d'.repeat(43))
+  })
+})
+
+describe('認証状態', () => {
+  it('認証済み応答を区別する', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({authenticated: true, storageMode: 'cloud', user: {id: 'u1', displayName: '利用者'}, csrfToken: 'csrf'}))))
+    await expect(fetchAuth()).resolves.toMatchObject({status: 'authenticated', authenticated: true})
+  })
+
+  it('明示的な未認証応答だけをゲスト扱いする', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({authenticated: false, storageMode: 'local'}))))
+    await expect(fetchAuth()).resolves.toMatchObject({status: 'unauthenticated', authenticated: false})
+  })
+
+  it.each([401, 500])('HTTP %i は認証確認不能とする', async status => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', {status})))
+    await expect(fetchAuth()).resolves.toMatchObject({status: 'unavailable'})
+  })
+
+  it('通信失敗では復帰トークンを保持し、ゲストへ切り替えない', async () => {
+    localStorage.setItem('paymentApp.loginResume.v1', 'e'.repeat(43))
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    await expect(fetchAuthWithResume()).resolves.toMatchObject({status: 'unavailable'})
+    expect(localStorage.getItem('paymentApp.loginResume.v1')).toBe('e'.repeat(43))
+  })
+
+  it('復帰待ちを通常のゲスト状態と区別する', async () => {
+    localStorage.setItem('paymentApp.loginResume.v1', 'f'.repeat(43))
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({authenticated: false, storageMode: 'local'})))
+      .mockResolvedValueOnce(new Response('', {status: 202})))
+    await expect(fetchAuthWithResume()).resolves.toMatchObject({status: 'unauthenticated', pendingResume: true})
   })
 })
