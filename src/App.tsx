@@ -27,7 +27,6 @@ import {
   loginUrl,
   logout,
   markGuestImportHandled,
-  resumePendingLogin,
 } from './data/repository'
 import type {PaymentRepository} from './data/repository'
 import {paymentCsv, paymentCsvFileName} from './csv'
@@ -71,7 +70,8 @@ const resolveGroup = (name: string, groups: PaymentGroup[], now: string) => {
 
 export default function App() {
   const [data, setData] = useState<StoredData>(() => migrateStoredData({}))
-  const [auth, setAuth] = useState<AuthState>({authenticated: false, storageMode: 'local'})
+  const [auth, setAuth] = useState<AuthState>({status: 'checking', authenticated: false, storageMode: 'local'})
+  const [authRetry, setAuthRetry] = useState(0)
   const [syncInfo, setSyncInfo] = useState<SyncInfo>({state: 'synced', pendingCount: 0})
   const [importGuest, setImportGuest] = useState<StoredData | null>(null)
   const [accountOpen, setAccountOpen] = useState(false)
@@ -95,8 +95,14 @@ export default function App() {
   useEffect(() => {
     let active = true
     const initialize = async () => {
+      storageReadyRef.current = false
+      setAuth({status: 'checking', authenticated: false, storageMode: 'local'})
       const nextAuth = await fetchAuthWithResume()
       if (!active) return
+      if (nextAuth.status === 'unavailable' || nextAuth.pendingResume) {
+        setAuth(nextAuth)
+        return
+      }
       const repository: PaymentRepository = nextAuth.authenticated && nextAuth.user && nextAuth.csrfToken
         ? new CloudPaymentRepository(nextAuth.user.id, nextAuth.csrfToken)
         : new LocalPaymentRepository()
@@ -115,7 +121,10 @@ export default function App() {
           if (guest.payments.length) setImportGuest(guest)
         }
       } catch (error) {
-        setNotice(error instanceof Error ? error.message : 'クラウドへ接続できません')
+        if (active) {
+          setAuth({status: 'unavailable', authenticated: false, storageMode: 'local'})
+          setNotice(error instanceof Error ? error.message : 'クラウドへ接続できません')
+        }
       }
       const loginError = new URLSearchParams(location.search).get('login_error')
       if (loginError) {
@@ -129,22 +138,22 @@ export default function App() {
       unsubscribeRef.current?.()
       repositoryRef.current?.dispose()
     }
-  }, [])
+  }, [authRetry])
   useEffect(() => {
-    let resuming = false
-    const resumeLogin = async () => {
-      if (document.visibilityState !== 'visible' || resuming || auth.authenticated) return
-      resuming = true
-      if (await resumePendingLogin()) location.reload()
-      resuming = false
+    const retry = () => {
+      if (document.visibilityState === 'visible' && (auth.status === 'unavailable' || auth.pendingResume)) {
+        setAuthRetry(value => value + 1)
+      }
     }
-    document.addEventListener('visibilitychange', resumeLogin)
-    window.addEventListener('pageshow', resumeLogin)
+    document.addEventListener('visibilitychange', retry)
+    window.addEventListener('pageshow', retry)
+    window.addEventListener('online', retry)
     return () => {
-      document.removeEventListener('visibilitychange', resumeLogin)
-      window.removeEventListener('pageshow', resumeLogin)
+      document.removeEventListener('visibilitychange', retry)
+      window.removeEventListener('pageshow', retry)
+      window.removeEventListener('online', retry)
     }
-  }, [auth.authenticated])
+  }, [auth.status, auth.pendingResume])
   useEffect(() => {
     if (storageReadyRef.current) repositoryRef.current?.save(data)
   }, [data])
@@ -359,7 +368,7 @@ export default function App() {
       unsubscribeRef.current = repository.subscribe(setSyncInfo)
       const guest = await repository.load()
       setData(guest)
-      setAuth({authenticated: false, storageMode: 'local'})
+      setAuth({status: 'unauthenticated', authenticated: false, storageMode: 'local'})
       storageReadyRef.current = true
       setAccountOpen(false)
       setNotice('この端末への保存に戻りました')
@@ -421,6 +430,13 @@ export default function App() {
   )
 
   const printTotal = filtered.reduce((total, payment) => total + payment.amount, 0)
+  if (auth.status === 'checking' || auth.status === 'unavailable' || auth.pendingResume) {
+    return <main><header className="hero"><div><p className="eyebrow">PAYMENT NOTE</p><h1>家計の支払めも</h1></div></header>
+      <section className="panel auth-message" role="status">
+        <h2>{auth.status === 'checking' ? 'ログイン状態を確認中…' : auth.pendingResume ? 'LINEログインの完了を待っています' : '認証状態を確認できません'}</h2>
+        {auth.status !== 'checking' && <><p>{notice || '通信を確認して再試行してください。'}</p><button className="primary" onClick={() => setAuthRetry(value => value + 1)}>再試行</button></>}
+      </section></main>
+  }
   return <>
     <main>
       <header className="hero">

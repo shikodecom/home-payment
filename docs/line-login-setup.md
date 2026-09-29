@@ -44,3 +44,7 @@ LINEログイン時には `GET https://api.line.me/friendship/v1/status` で友�
 - `APP_LOGIN_SUCCESS_URL=https://www.shikode.com/tools/home-payment/`
 
 ログインはAuthorization Code Flow、OpenID Connect、state、nonce、PKCE（S256）を使用します。IDトークンはサーバーからLINE公式の検証エンドポイントへ送り、issuer、audience、有効期限、nonceも確認します。
+
+セッションは30日有効で、残り7日未満の有効なセッションを使用すると期限が再び30日に延長されます。30日以上使用しなかった場合は再ログインが必要です。Cookieは `home_payment_session` と `home_payment_csrf` を `/tools/home-payment/` に限定します。旧Cookie名から切り替えた後は一度だけ再ログインが必要です。
+
+`/auth/me` の通信障害時は、アプリが認証状態を確認できない画面と再試行ボタンを表示します。この間はゲスト領域への記録を開始できません。サーバーログにはセッションCookieなし、未登録、期限切れ、失効済み、DB障害を区別して記録し、トークン値は記録しません。

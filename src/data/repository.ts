@@ -328,16 +328,23 @@ export class CloudPaymentRepository implements PaymentRepository {
 export async function fetchAuth(): Promise<AuthState> {
   try {
     const response = await fetch(API_BASE + '/auth/me', {credentials: 'same-origin', cache: 'no-store'})
-    if (!response.ok) return {authenticated: false, storageMode: 'local'}
-    return await response.json() as AuthState
+    if (!response.ok) return {status: 'unavailable', authenticated: false, storageMode: 'local'}
+    const result = await response.json() as AuthState
+    if (result.authenticated === true && result.user?.id && result.csrfToken) {
+      return {...result, status: 'authenticated'}
+    }
+    if (result.authenticated === false) {
+      return {status: 'unauthenticated', authenticated: false, storageMode: 'local'}
+    }
   } catch {
-    return {authenticated: false, storageMode: 'local'}
+    // A temporary network failure must not select the guest repository.
   }
+  return {status: 'unavailable', authenticated: false, storageMode: 'local'}
 }
 
-export async function resumePendingLogin(): Promise<boolean> {
+export async function resumePendingLogin(): Promise<'completed' | 'pending' | 'invalid' | 'unavailable' | 'none'> {
   const token = localStorage.getItem(LOGIN_RESUME_KEY)
-  if (!token) return false
+  if (!token) return 'none'
   try {
     const response = await fetch(API_BASE + '/auth/line/resume', {
       method: 'POST',
@@ -347,24 +354,31 @@ export async function resumePendingLogin(): Promise<boolean> {
     })
     if (response.status === 200) {
       localStorage.removeItem(LOGIN_RESUME_KEY)
-      return true
+      return 'completed'
     }
+    if (response.status === 202) return 'pending'
     if ([400, 401, 410, 422].includes(response.status)) {
       localStorage.removeItem(LOGIN_RESUME_KEY)
+      return 'invalid'
     }
   } catch {
     // Keep the one-time token so a later online resume can complete the login.
   }
-  return false
+  return 'unavailable'
 }
 
 export async function fetchAuthWithResume(): Promise<AuthState> {
   const auth = await fetchAuth()
-  if (auth.authenticated) {
+  if (auth.status === 'authenticated') {
     localStorage.removeItem(LOGIN_RESUME_KEY)
     return auth
   }
-  return await resumePendingLogin() ? fetchAuth() : auth
+  if (auth.status === 'unavailable') return auth
+  const resume = await resumePendingLogin()
+  if (resume === 'completed') return fetchAuth()
+  if (resume === 'pending') return {...auth, pendingResume: true}
+  if (resume === 'unavailable') return {status: 'unavailable', authenticated: false, storageMode: 'local'}
+  return auth
 }
 
 export async function logout(csrfToken: string) {

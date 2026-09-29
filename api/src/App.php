@@ -43,8 +43,11 @@ final class App
             'lineCallback' => $this->env('LINE_CALLBACK_URL', ''),
             'lineMessagingSecret' => $this->env('LINE_MESSAGING_CHANNEL_SECRET', ''),
             'lineMessagingToken' => $this->env('LINE_MESSAGING_CHANNEL_ACCESS_TOKEN', ''),
-            'cookie' => $this->env('SESSION_COOKIE_NAME', 'payment_session'),
+            'cookie' => $this->env('SESSION_COOKIE_NAME', 'home_payment_session'),
+            'csrfCookie' => $this->env('CSRF_COOKIE_NAME', 'home_payment_csrf'),
+            'cookiePath' => $this->env('SESSION_COOKIE_PATH', '/tools/home-payment/'),
             'sessionLifetime' => max(3600, (int)$this->env('SESSION_LIFETIME_SECONDS', '2592000')),
+            'sessionRefreshThreshold' => max(0, (int)$this->env('SESSION_REFRESH_THRESHOLD_SECONDS', '604800')),
             'csrfSecret' => $this->env('CSRF_SECRET', ''),
             'loginLimit' => max(1, (int)$this->env('LOGIN_RATE_LIMIT_PER_15_MINUTES', '20')),
         ];
@@ -331,7 +334,7 @@ final class App
 
     private function issueSession(string $userId): void
     {
-        $old = $this->currentSession(false);
+        $old = $this->currentSession(false, false);
         if ($old) $this->db->prepare('UPDATE user_sessions SET revoked_at=UTC_TIMESTAMP(6) WHERE id=?')->execute([$old['id']]);
         $token = self::randomToken(48);
         $csrf = self::randomToken(32);
@@ -347,7 +350,7 @@ final class App
             substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 512), $this->clientIp(),
         ]);
         $this->setCookie($this->config['cookie'], $token, true, $this->config['sessionLifetime']);
-        $this->setCookie('payment_csrf', $csrf, false, $this->config['sessionLifetime']);
+        $this->setCookie($this->config['csrfCookie'], $csrf, false, $this->config['sessionLifetime']);
     }
 
     private function authMe(): void
@@ -357,11 +360,11 @@ final class App
             self::json(['authenticated' => false, 'storageMode' => 'local']);
             return;
         }
-        $csrf = (string)($_COOKIE['payment_csrf'] ?? '');
+        $csrf = (string)($_COOKIE[$this->config['csrfCookie']] ?? '');
         if ($csrf === '' || !hash_equals($session['csrf_token_hash'], $this->csrfHash($csrf))) {
             $csrf = self::randomToken(32);
             $this->db->prepare('UPDATE user_sessions SET csrf_token_hash=? WHERE id=?')->execute([$this->csrfHash($csrf), $session['id']]);
-            $this->setCookie('payment_csrf', $csrf, false, max(60, strtotime($session['expires_at']) - time()));
+            $this->setCookie($this->config['csrfCookie'], $csrf, false, max(60, (new DateTimeImmutable($session['expires_at'], new DateTimeZone('UTC')))->getTimestamp() - time()));
         }
         if ($session['line_friend_added'] === null && is_string($session['provider_user_id'] ?? null)) {
             $friendAdded = $this->lineMessagingFriendStatus($session['provider_user_id']);
@@ -390,7 +393,7 @@ final class App
     {
         $this->db->prepare('UPDATE user_sessions SET revoked_at=UTC_TIMESTAMP(6) WHERE id=?')->execute([$session['id']]);
         $this->setCookie($this->config['cookie'], '', true, -3600);
-        $this->setCookie('payment_csrf', '', false, -3600);
+        $this->setCookie($this->config['csrfCookie'], '', false, -3600);
         self::json(['ok' => true, 'storageMode' => 'local']);
     }
 
@@ -536,27 +539,55 @@ final class App
         }
     }
 
-    private function currentSession(bool $required = true): ?array
+    private function currentSession(bool $required = true, bool $refresh = true): ?array
     {
         $token = (string)($_COOKIE[$this->config['cookie']] ?? '');
         if ($token === '') {
+            error_log('[home-payment auth] session_cookie_missing');
             if ($required) throw new HttpError(401, 'セッションの有効期限が切れました');
             return null;
         }
-        $stmt = $this->db->prepare(
-            "SELECT s.*,u.display_name,u.profile_image_url,u.line_friend_added,i.provider_user_id
-             FROM user_sessions s
-             JOIN users u ON u.id=s.user_id
-             LEFT JOIN auth_identities i ON i.user_id=u.id AND i.provider='line'
-             WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at > UTC_TIMESTAMP(6)"
-        );
-        $stmt->execute([hash('sha256', $token)]);
-        $session = $stmt->fetch();
-        if (!$session) {
+        try {
+            $stmt = $this->db->prepare(
+                "SELECT s.*,u.display_name,u.profile_image_url,u.line_friend_added,i.provider_user_id
+                 FROM user_sessions s
+                 JOIN users u ON u.id=s.user_id
+                 LEFT JOIN auth_identities i ON i.user_id=u.id AND i.provider='line'
+                 WHERE s.token_hash=?"
+            );
+            $stmt->execute([hash('sha256', $token)]);
+            $session = $stmt->fetch();
+        } catch (PDOException $error) {
+            error_log('[home-payment auth] auth_db_error');
+            throw $error;
+        }
+        $reason = !$session ? 'session_not_found'
+            : ($session['revoked_at'] !== null ? 'session_revoked'
+                : ((new DateTimeImmutable($session['expires_at'], new DateTimeZone('UTC')))->getTimestamp() <= time() ? 'session_expired' : null));
+        if ($reason !== null) error_log('[home-payment auth] ' . $reason);
+        if ($reason !== null) {
             if ($required) throw new HttpError(401, 'セッションの有効期限が切れました');
             return null;
         }
-        $this->db->prepare('UPDATE user_sessions SET last_used_at=UTC_TIMESTAMP(6) WHERE id=?')->execute([$session['id']]);
+        if ($refresh) {
+            try {
+                if ((new DateTimeImmutable($session['expires_at'], new DateTimeZone('UTC')))->getTimestamp() - time() < $this->config['sessionRefreshThreshold']) {
+                    $this->db->prepare('UPDATE user_sessions SET last_used_at=UTC_TIMESTAMP(6), expires_at=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? SECOND) WHERE id=?')
+                        ->execute([$this->config['sessionLifetime'], $session['id']]);
+                    $session['expires_at'] = gmdate('Y-m-d H:i:s', time() + $this->config['sessionLifetime']);
+                    $this->setCookie($this->config['cookie'], $token, true, $this->config['sessionLifetime']);
+                    $csrf = (string)($_COOKIE[$this->config['csrfCookie']] ?? '');
+                    if ($csrf !== '' && hash_equals($session['csrf_token_hash'], $this->csrfHash($csrf))) {
+                        $this->setCookie($this->config['csrfCookie'], $csrf, false, $this->config['sessionLifetime']);
+                    }
+                } else {
+                    $this->db->prepare('UPDATE user_sessions SET last_used_at=UTC_TIMESTAMP(6) WHERE id=?')->execute([$session['id']]);
+                }
+            } catch (PDOException $error) {
+                error_log('[home-payment auth] auth_db_error');
+                throw $error;
+            }
+        }
         return $session;
     }
 
@@ -569,7 +600,7 @@ final class App
     {
         $this->requireRequestOrigin();
         $header = (string)($_SERVER['HTTP_X_CSRF_TOKEN'] ?? '');
-        $cookie = (string)($_COOKIE['payment_csrf'] ?? '');
+        $cookie = (string)($_COOKIE[$this->config['csrfCookie']] ?? '');
         if ($header === '' || $cookie === '' || !hash_equals($cookie, $header) ||
             !hash_equals($session['csrf_token_hash'], $this->csrfHash($header))) {
             throw new HttpError(403, '操作を確認できませんでした');
@@ -1166,7 +1197,7 @@ final class App
     {
         setcookie($name, $value, [
             'expires' => time() + $maxAge,
-            'path' => '/',
+            'path' => $this->config['cookiePath'],
             'secure' => $this->config['env'] === 'production',
             'httponly' => $httpOnly,
             'samesite' => 'Lax',
