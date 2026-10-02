@@ -177,6 +177,11 @@ try {
         [$status, $all] = request('GET', '/archive-batches');
         $listed = array_values(array_filter($all['archives'], fn($a) => $a['id'] === $result['archive']['id']))[0];
         equal($listed['paymentIds'], $result['archive']['paymentIds'], 'list and detail IDs agree');
+        [$stateStatus, $cloudState] = request('GET', '/state');
+        equal($stateStatus, 200, 'consistent state read');
+        $stateArchive = array_values(array_filter($cloudState['archives'], fn($a) => $a['id'] === $listed['id']))[0];
+        equal($stateArchive['paymentIds'], $listed['paymentIds'], 'state membership agrees');
+        equal(count(array_filter($cloudState['payments'], fn($p) => $p['archiveBatchId'] === $listed['id'])), $count, 'state payments agree with archive membership');
         foreach ($listed['paymentIds'] as $id) equal(strlen($id), 36, 'complete UUID');
         [$status, $restoredMany] = request('POST', '/archive-batches/' . $result['archive']['id'] . '/restore', null, uuid());
         equal($status, 200, 'restore all members');

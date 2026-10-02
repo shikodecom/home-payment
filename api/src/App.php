@@ -121,7 +121,7 @@ final class App
             elseif ($method === 'DELETE') $this->mutation($session['user_id'], fn() => $this->deletePayment($session['user_id'], $match[1]), 200);
             else throw new HttpError(405, '許可されていない操作です');
         } elseif ($method === 'GET' && $route === '/archive-batches') {
-            self::json(['archives' => $this->listArchives($session['user_id'])]);
+            self::json(['archives' => $this->snapshot(fn() => $this->listArchives($session['user_id']))]);
         } elseif ($method === 'POST' && $route === '/archive-batches/process') {
             $this->mutation($session['user_id'], fn() => $this->processArchive($session['user_id']), 201);
         } elseif (preg_match('#^/archive-batches/([0-9a-f-]{36})/restore$#i', $route, $match) && $method === 'POST') {
@@ -617,11 +617,24 @@ final class App
 
     private function getState(string $userId): void
     {
-        self::json([
+        self::json($this->snapshot(fn() => [
             'payments' => $this->listPayments($userId),
             'archives' => $this->listArchives($userId),
             'settings' => $this->getSettings($userId),
-        ]);
+        ]));
+    }
+
+    private function snapshot(callable $read): array
+    {
+        $this->db->beginTransaction();
+        try {
+            $result = $read();
+            $this->db->commit();
+            return $result;
+        } catch (Throwable $error) {
+            if ($this->db->inTransaction()) $this->db->rollBack();
+            throw $error;
+        }
     }
 
     private function listPayments(string $userId): array
