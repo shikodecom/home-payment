@@ -53,6 +53,10 @@ type QueueOperation = {
   path: string
   body?: Record<string, unknown>
   paymentId?: string
+  paymentIds?: string[]
+  sent?: boolean
+  failure?: {status: number; message: string; serverMemo?: string}
+  originalPayment?: Payment
 }
 
 export interface PaymentRepository {
@@ -63,6 +67,8 @@ export interface PaymentRepository {
   importGuest(data: StoredData): Promise<void>
   subscribe(listener: (info: SyncInfo) => void): () => void
   dispose(): void
+  resolveConflict?(choice: 'server' | 'local'): Promise<StoredData>
+  exportBackup?(): string
 }
 
 export class LocalPaymentRepository implements PaymentRepository {
@@ -100,8 +106,9 @@ export class CloudPaymentRepository implements PaymentRepository {
   private readonly queueKey: string
   private listener?: (info: SyncInfo) => void
   private previous?: StoredData
-  private syncing = false
-  private versions = new Map<string, number>()
+  private syncPromise?: Promise<void>
+  private disposed = false
+  private revision = 0
 
   constructor(private userId: string, private csrfToken: string) {
     this.cacheKey = `paymentApp.cloud.${userId}.cache.v1`
@@ -110,14 +117,19 @@ export class CloudPaymentRepository implements PaymentRepository {
   }
 
   async load() {
+    const cached = this.cached()
+    if (cached) this.previous = structuredClone(cached)
+    await this.syncNow()
+    if (this.queue().length) {
+      if (!cached) throw new Error('未送信データが残っています。端末のバックアップを確認してください')
+      return this.cached() || cached
+    }
     try {
-      await this.syncNow()
       return await this.fetchCloudState()
     } catch {
-      const cached = localStorage.getItem(this.cacheKey)
-      if (!cached) throw new Error('クラウドへ接続できません')
-      const data = migrateStoredData(JSON.parse(cached))
-      this.previous = data
+      const data = this.cached()
+      if (!data) throw new Error('クラウドへ接続できません')
+      this.previous = structuredClone(data)
       this.emit('failed', 'クラウドへ接続できません。端末内のキャッシュを表示しています')
       return data
     }
@@ -125,19 +137,17 @@ export class CloudPaymentRepository implements PaymentRepository {
 
   async refresh() {
     await this.syncNow()
-    if (this.queue().length) {
-      throw new Error('同期待ちのデータをクラウドへ保存できませんでした')
-    }
+    if (this.queue().length) throw new Error('同期待ちのデータをクラウドへ保存できませんでした')
     return this.fetchCloudState()
   }
 
-  save(data: StoredData) {
+  save(input: StoredData) {
+    // React may still hold a version from before our own successful request.
+    const versions = new Map(this.previous?.payments.map(payment => [payment.id, payment.version]))
+    const data = {...input, payments: input.payments.map(payment => ({...payment, version: versions.get(payment.id) ?? payment.version}))}
+    this.revision++
     localStorage.setItem(this.cacheKey, JSON.stringify(data))
-    if (!this.previous) {
-      this.previous = data
-      return
-    }
-    this.enqueueDiff(this.previous, data)
+    if (this.previous) this.enqueueDiff(this.previous, data)
     this.previous = structuredClone(data)
     void this.syncNow()
   }
@@ -146,6 +156,7 @@ export class CloudPaymentRepository implements PaymentRepository {
     await this.request('/import/local', {
       method: 'POST',
       body: JSON.stringify({
+        importSourceId: guestImportSourceId(),
         payments: data.payments,
         archives: data.archives,
         groups: data.groups,
@@ -164,43 +175,152 @@ export class CloudPaymentRepository implements PaymentRepository {
   dispose() {
     window.removeEventListener('online', this.online)
     this.listener = undefined
+    this.disposed = true
   }
 
   async syncNow() {
-    if (this.syncing || !navigator.onLine) {
+    if (this.syncPromise) return this.syncPromise
+    if (this.disposed || !navigator.onLine) {
       if (this.queue().length) this.emit('pending')
       return
     }
-    this.syncing = true
-    try {
-      while (this.queue().length) {
-        const operation = this.queue()[0]
-        this.emit('syncing')
-        try {
-          const body = {...operation.body}
-          if (operation.method === 'PATCH' && operation.paymentId) {
-            body.version = this.versions.get(operation.paymentId) ?? body.version
-          }
-          const result = await this.request(operation.path, {
-            method: operation.method,
-            body: operation.body ? JSON.stringify(body) : undefined,
-          }) as {payment?: CloudPayment}
-          if (result.payment) this.versions.set(result.payment.clientId, result.payment.version)
-          this.removeOperation(operation.id)
-        } catch (error) {
-          const message = error instanceof ApiError && error.status === 409
-            ? '別の端末で更新されています。再読み込みしてください'
-            : error instanceof ApiError && error.status === 401
-              ? 'セッションの有効期限が切れました。もう一度LINEでログインしてください'
-              : '同期できません。データは端末内に残っています'
-          this.emit('failed', message)
-          break
+    this.syncPromise = this.drainQueue()
+    try { await this.syncPromise } finally { this.syncPromise = undefined }
+  }
+
+  private async drainQueue() {
+    while (!this.disposed && this.queue().length) {
+      let operation = this.queue()[0]
+      if (operation.failure) { this.emit('failed', operation.failure.message); return }
+      this.emit('syncing')
+      try {
+        // Persist before dispatch. Once sent, an operation is immutable even if
+        // its response is lost or the app restarts while it is in flight.
+        operation = {...operation, sent: true}
+        this.setQueue(this.queue().map(item => item.id === operation.id ? operation : item))
+        const result = await this.request(operation.path, {
+          method: operation.method,
+          headers: {'X-Operation-Id': operation.id},
+          body: operation.body ? JSON.stringify(operation.body) : undefined,
+        }) as {payment?: CloudPayment; payments?: CloudPayment[]; archive?: CloudArchive}
+        this.acceptResult(operation, result)
+      } catch (error) {
+        const status = error instanceof ApiError ? error.status : 0
+        const message = status === 401 ? 'セッションの有効期限が切れました。もう一度LINEでログインしてください'
+          : [400, 404, 409, 422].includes(status) ? (error instanceof Error ? error.message : '変更を確認してください')
+          : '同期できません。データは端末内に残っています'
+        if ([400, 404, 409, 422].includes(status)) {
+          const server = error instanceof ApiError ? (error.data as {payment?: CloudPayment}).payment : undefined
+          this.setQueue(this.queue().map(item => item.id === operation.id ? {...item, failure: {status, message, serverMemo: server?.memo}} : item))
+        }
+        this.emit('failed', message)
+        return
+      }
+    }
+    if (!this.queue().length) this.emit('synced')
+  }
+
+  private acceptResult(operation: QueueOperation, result: {payment?: CloudPayment; payments?: CloudPayment[]; archive?: CloudArchive}) {
+    const payments = result.payment ? [result.payment] : result.payments || []
+    const versions = new Map(payments.map(payment => [payment.clientId, payment]))
+    const next = this.queue().filter(item => item.id !== operation.id).map(item => {
+      if (item.sent) return item
+      const body = {...item.body}
+      if (item.paymentId && versions.has(item.paymentId)) body.version = Math.max(Number(body.version) || 0, versions.get(item.paymentId)!.version)
+      if (Array.isArray(body.payments)) body.payments = body.payments.map((payment: {clientId: string; version?: number}) => ({...payment, version: versions.has(payment.clientId) ? Math.max(payment.version || 0, versions.get(payment.clientId)!.version) : payment.version}))
+      return {...item, body: item.body ? body : undefined}
+    })
+    const cached = this.cached()
+    if (cached) {
+      cached.payments = cached.payments.map(payment => {
+        const accepted = versions.get(payment.id)
+        if (!accepted) return payment
+        return {...payment, version: Math.max(payment.version || 0, accepted.version), serverId: accepted.serverId,
+          archivedAt: payment.archiveBatchId && payment.archiveBatchId === accepted.archiveBatchId ? accepted.processedAt || undefined : payment.archivedAt}
+      })
+      if (result.archive) {
+        const archive = result.archive
+        cached.archives = cached.archives.map(item => item.id === archive.id ? {...item, paymentIds: archive.paymentIds, totalAmount: archive.totalAmount, archivedAt: archive.processedAt} : item)
+      }
+      this.previous = structuredClone(cached)
+      localStorage.setItem(this.cacheKey, JSON.stringify(cached))
+    }
+    this.setQueue(next)
+  }
+
+  async resolveConflict(choice: 'server' | 'local') {
+    await this.syncNow()
+    const queue = this.queue()
+    const blocked = queue[0]
+    if (!blocked?.failure) throw new Error('解決する同期エラーはありません')
+    const remote = cloudToStored(await this.request('/state') as CloudState)
+    if (JSON.stringify(this.queue()) !== JSON.stringify(queue)) throw new Error('別の画面で変更されています。確認し直してください')
+    const local = this.cached()
+    if (!local) throw new Error('端末のデータが見つかりません')
+    localStorage.setItem(`${this.cacheKey}.backup.${crypto.randomUUID()}`, JSON.stringify({data: local, queue, savedAt: new Date().toISOString()}))
+    if (choice === 'local') {
+      if (blocked.method !== 'PATCH' || !blocked.paymentId || blocked.failure.status !== 409) throw new Error('この操作は取り消して、対象を確認し直してください')
+      const payment = remote.payments.find(item => item.id === blocked.paymentId)
+      if (!payment || payment.archivedAt) throw new Error('支払いが削除または処理済みに変更されています。サーバーの内容を使ってください')
+      queue[0] = {...blocked, id: crypto.randomUUID(), body: {...blocked.body, version: payment.version}, sent: false, failure: undefined}
+      this.setQueue(queue)
+    } else {
+      // Cancel dependent operations too; preserve independent edits and replay
+      // their optimistic display over the freshly read server state.
+      const affected = new Set(this.operationPaymentIds(blocked))
+      const removed = new Set([blocked.id])
+      for (const item of queue) {
+        if (removed.has(item.id) || this.operationPaymentIds(item).some(id => affected.has(id))) {
+          removed.add(item.id)
+          this.operationPaymentIds(item).forEach(id => affected.add(id))
         }
       }
-      if (!this.queue().length) this.emit('synced')
-    } finally {
-      this.syncing = false
+      const remaining = queue.filter(item => !removed.has(item.id))
+      const merged = this.overlayPending(remote, local, remaining)
+      localStorage.setItem(this.cacheKey, JSON.stringify(merged))
+      this.previous = structuredClone(merged)
+      this.revision++
+      this.setQueue(remaining)
     }
+    await this.syncNow()
+    return this.queue().length ? this.cached()! : this.fetchCloudState()
+  }
+
+  private operationPaymentIds(operation: QueueOperation) {
+    return operation.paymentId ? [operation.paymentId] : operation.paymentIds || []
+  }
+
+  exportBackup() {
+    const backups: unknown[] = []
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index)
+      if (key?.startsWith(`${this.cacheKey}.backup.`)) backups.push(JSON.parse(localStorage.getItem(key)!))
+    }
+    return JSON.stringify({data: this.cached(), operations: this.queue(), backups}, null, 2)
+  }
+
+  private overlayPending(remote: StoredData, local: StoredData, queue: QueueOperation[]): StoredData {
+    const dirty = new Set(queue.flatMap(item => this.operationPaymentIds(item)))
+    const archiveIds = new Set(queue.map(item => item.body?.clientBatchId || item.path.match(/^\/archive-batches\/([0-9a-f-]{36})/)?.[1]).filter(Boolean))
+    const groups = new Map([...remote.groups, ...local.groups.map(group => ({...group, id: cloudGroupId(group.name)}))].map(group => [group.id, group]))
+    const localGroups = new Map(local.groups.map(group => [group.id, cloudGroupId(group.name)]))
+    const remotePayments = new Map(remote.payments.map(payment => [payment.id, payment]))
+    return {...remote, groups: [...groups.values()],
+      currentGroupName: queue.some(item => item.path === '/settings') ? local.currentGroupName : remote.currentGroupName,
+      payments: [...remote.payments.filter(item => !dirty.has(item.id)), ...local.payments.filter(item => dirty.has(item.id)).map(item => {
+        const pendingArchive = queue.some(operation => operation.path.startsWith('/archive-batches/') && this.operationPaymentIds(operation).includes(item.id))
+        const stored = remotePayments.get(item.id)
+        return {...item, groupId: localGroups.get(item.groupId) || item.groupId,
+          archivedAt: pendingArchive ? item.archivedAt : stored?.archivedAt,
+          archiveBatchId: pendingArchive ? item.archiveBatchId : stored?.archiveBatchId}
+      })],
+      archives: [...remote.archives.filter(item => !archiveIds.has(item.id)), ...local.archives.filter(item => archiveIds.has(item.id)).map(item => ({...item, groupId: localGroups.get(item.groupId) || item.groupId}))],
+    }
+  }
+
+  private cached(): StoredData | null {
+    const value = localStorage.getItem(this.cacheKey)
+    return value ? migrateStoredData(JSON.parse(value)) : null
   }
 
   private enqueueDiff(before: StoredData, after: StoredData) {
@@ -230,14 +350,15 @@ export class CloudPaymentRepository implements PaymentRepository {
         this.pushOperation({
           method: 'PATCH',
           path: `/payments/${payment.id}`,
-          body: {...paymentBody(payment, groups), version: old.version || this.versions.get(payment.id)},
+          body: {...paymentBody(payment, groups), version: old.version},
           paymentId: payment.id,
+          originalPayment: old,
         })
       }
     }
     for (const payment of before.payments) {
       if (!afterPayments.has(payment.id) && !archivePaymentIds.has(payment.id)) {
-        this.pushOperation({method: 'DELETE', path: `/payments/${payment.id}`, paymentId: payment.id})
+        this.pushOperation({method: 'DELETE', path: `/payments/${payment.id}`, paymentId: payment.id, body: {version: payment.version}, originalPayment: payment})
       }
     }
     for (const archive of addedArchives) {
@@ -247,16 +368,18 @@ export class CloudPaymentRepository implements PaymentRepository {
       this.pushOperation({
         method: 'POST',
         path: '/archive-batches/process',
+        paymentIds: archive.paymentIds,
         body: {
           clientBatchId: archive.id,
+          payments: archive.paymentIds.map(id => ({clientId: id, version: beforePayments.get(id)?.version})),
           groupName: groups.get(archive.groupId) || UNCLASSIFIED_GROUP_NAME,
           billingTargetType: choice === 'other' ? 'other' : choice === 'unset' ? 'unset' : 'household',
           billingTargetName: choice === 'other' ? payment.reimbursementTarget : null,
         },
       })
     }
-    restoredArchives.forEach(archive => this.pushOperation({method: 'POST', path: `/archive-batches/${archive.id}/restore`}))
-    deletedArchives.forEach(archive => this.pushOperation({method: 'DELETE', path: `/archive-batches/${archive.id}`}))
+    restoredArchives.forEach(archive => this.pushOperation({method: 'POST', path: `/archive-batches/${archive.id}/restore`, paymentIds: archive.paymentIds}))
+    deletedArchives.forEach(archive => this.pushOperation({method: 'DELETE', path: `/archive-batches/${archive.id}`, paymentIds: archive.paymentIds}))
 
     if (before.currentGroupName !== after.currentGroupName) {
       this.pushOperation({
@@ -270,7 +393,7 @@ export class CloudPaymentRepository implements PaymentRepository {
   private pushOperation(operation: Omit<QueueOperation, 'id'>) {
     const queue = this.queue()
     if (operation.paymentId) {
-      const pendingCreate = queue.find(item => item.paymentId === operation.paymentId && item.method === 'POST' && item.path === '/payments')
+      const pendingCreate = queue.find(item => item.paymentId === operation.paymentId && item.method === 'POST' && item.path === '/payments' && !item.sent && !queue.some(dependent => dependent.paymentIds?.includes(operation.paymentId!)))
       if (pendingCreate && operation.method === 'PATCH') {
         pendingCreate.body = operation.body
         this.setQueue(queue)
@@ -281,12 +404,16 @@ export class CloudPaymentRepository implements PaymentRepository {
         return
       }
     }
-    queue.push({id: crypto.randomUUID(), ...operation})
+    queue.push({id: crypto.randomUUID(), sent: false, ...operation})
     this.setQueue(queue)
   }
 
   private queue(): QueueOperation[] {
-    try { return JSON.parse(localStorage.getItem(this.queueKey) || '[]') as QueueOperation[] } catch { return [] }
+    const queue = JSON.parse(localStorage.getItem(this.queueKey) || '[]') as QueueOperation[]
+    if (!Array.isArray(queue)) throw new Error('未送信データを読み込めません。端末のバックアップを確認してください')
+    // Old queues did not record whether a request had already left the device.
+    // Treat them as potentially sent rather than merging away a later edit.
+    return queue.map(operation => ({...operation, sent: operation.sent ?? true}))
   }
   private setQueue(queue: QueueOperation[]) {
     localStorage.setItem(this.queueKey, JSON.stringify(queue))
@@ -296,16 +423,23 @@ export class CloudPaymentRepository implements PaymentRepository {
     this.setQueue(this.queue().filter(operation => operation.id !== id))
   }
   private emit(state: SyncInfo['state'], message?: string) {
-    this.listener?.({state, pendingCount: this.queue().length, message})
+    const blocked = this.queue()[0]
+    this.listener?.({state: blocked?.failure ? 'failed' : state, pendingCount: this.queue().length, message: message || blocked?.failure?.message,
+      blocked: blocked?.failure ? {operationId: blocked.id, ...blocked.failure, canReapply: blocked.method === 'PATCH' && Boolean(blocked.paymentId) && blocked.failure.status === 409, localMemo: typeof blocked.body?.memo === 'string' ? blocked.body.memo : undefined} : undefined})
   }
   private online = () => { void this.syncNow() }
 
   private async fetchCloudState() {
+    const revision = this.revision
+    const initialCache = localStorage.getItem(this.cacheKey)
     const response = await this.request('/state')
+    if (this.queue().length || revision !== this.revision || initialCache !== localStorage.getItem(this.cacheKey)) {
+      const cached = this.cached()
+      if (cached) { this.previous = structuredClone(cached); return cached }
+      throw new Error('同期待ちのデータが残っています')
+    }
     const data = cloudToStored(response as CloudState)
     this.previous = structuredClone(data)
-    this.versions.clear()
-    data.payments.forEach(payment => payment.version && this.versions.set(payment.id, payment.version))
     localStorage.setItem(this.cacheKey, JSON.stringify(data))
     return data
   }
@@ -313,11 +447,12 @@ export class CloudPaymentRepository implements PaymentRepository {
   private async request(path: string, init: RequestInit = {}) {
     const response = await fetch(API_BASE + path, {
       credentials: 'same-origin',
+      ...init,
       headers: {
         ...(init.body ? {'Content-Type': 'application/json'} : {}),
         ...(init.method && init.method !== 'GET' ? {'X-CSRF-Token': this.csrfToken} : {}),
+        ...init.headers,
       },
-      ...init,
     })
     const json = await response.json().catch(() => ({}))
     if (!response.ok) throw new ApiError(response.status, json.error || 'クラウドへ接続できません', json)
@@ -367,7 +502,12 @@ export async function resumePendingLogin(): Promise<'completed' | 'pending' | 'i
   return 'unavailable'
 }
 
+export function cancelPendingLogin() {
+  localStorage.removeItem(LOGIN_RESUME_KEY)
+}
+
 export async function fetchAuthWithResume(): Promise<AuthState> {
+  if (typeof location !== 'undefined' && new URLSearchParams(location.search).has('login_error')) cancelPendingLogin()
   const auth = await fetchAuth()
   if (auth.status === 'authenticated') {
     localStorage.removeItem(LOGIN_RESUME_KEY)
@@ -407,6 +547,13 @@ export function guestImportWasHandled(userId: string) {
 
 export function markGuestImportHandled(userId: string) {
   localStorage.setItem(IMPORTED_PREFIX + userId, 'skipped')
+}
+
+function guestImportSourceId() {
+  const key = 'paymentApp.guest.importSource.v1'
+  let id = localStorage.getItem(key)
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem(key, id) }
+  return id
 }
 
 export async function loadGuestData() {

@@ -73,4 +73,5 @@ export interface SyncInfo {
   state: SyncState
   pendingCount: number
   message?: string
+  blocked?: {operationId: string; status: number; message: string; canReapply: boolean; localMemo?: string; serverMemo?: string}
 }

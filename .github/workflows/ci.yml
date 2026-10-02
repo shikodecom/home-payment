@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Check generated files stay out of the working tree
+        run: test -z "$(git status --porcelain)"
+
+  php:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ['8.2', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_mysql, curl, mbstring
+          coverage: none
+      - run: php api/tests/security_static_test.php && php api/tests/session_test.php && php api/tests/line_message_parser_test.php
+      - run: find api -name '*.php' -print0 | xargs -0 -n1 php -l
+
+  mysql:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mysql: ['5.7', '8.0']
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: integration-only
+          MYSQL_DATABASE: home_payment_test
+        ports:
+          - 3306/tcp
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: ${{ job.services.mysql.ports[3306] }}
+      DB_NAME: home_payment_test
+      DB_USER: root
+      DB_PASSWORD: integration-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo_mysql, curl, mbstring
+          coverage: none
+      - run: php api/tests/mysql_integration_test.php
