@@ -91,6 +91,7 @@ try {
     equal(request('POST', '/payments', $input, $operation)[1], $created, 'lost create response replay');
     equal(request('POST', '/payments', array_replace($input, ['amount' => 900]), $operation)[0], 409, 'changed operation content');
     equal(request('POST', '/payments', $input, $operation, false)[0], 403, 'replay still checks CSRF');
+    equal(request('POST', '/payments', array_replace($input, ['memo' => str_repeat('x', 2097153)]), uuid())[0], 413, 'receipt hashing respects body size limit');
     $patchId = uuid();
     $patch = $input + ['version' => 1];
     $patch['memo'] = '編集';

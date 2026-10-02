@@ -58,7 +58,6 @@ jobs:
           --health-retries=10
     env:
       DB_HOST: 127.0.0.1
-      DB_PORT: ${{ job.services.mysql.ports[3306] }}
       DB_NAME: home_payment_test
       DB_USER: root
       DB_PASSWORD: integration-only
@@ -70,3 +69,5 @@ jobs:
           extensions: pdo_mysql, curl, mbstring
           coverage: none
       - run: php api/tests/mysql_integration_test.php
+        env:
+          DB_PORT: ${{ job.services.mysql.ports[3306] }}

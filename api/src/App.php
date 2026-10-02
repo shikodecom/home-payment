@@ -637,7 +637,7 @@ final class App
     {
         $operationId = (string)($_SERVER['HTTP_X_OPERATION_ID'] ?? '');
         if ($operationId !== '' && !self::validUuid($operationId)) throw new HttpError(422, '操作IDが正しくありません');
-        $requestHash = hash('sha256', ($_SERVER['REQUEST_METHOD'] ?? '') . ':' . $this->routePath() . ':' . file_get_contents('php://input'));
+        $requestHash = hash('sha256', ($_SERVER['REQUEST_METHOD'] ?? '') . ':' . $this->routePath() . ':' . $this->rawInput());
         $this->db->beginTransaction();
         try {
             if ($operationId !== '') {
@@ -1168,13 +1168,18 @@ final class App
         if (!$https) throw new HttpError(400, 'HTTPSでアクセスしてください');
     }
 
-    private function jsonInput(): array
+    private function rawInput(): string
     {
         $length = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
         if ($length > self::MAX_BODY_BYTES) throw new HttpError(413, '送信データが大きすぎます');
         $raw = file_get_contents('php://input', false, null, 0, self::MAX_BODY_BYTES + 1);
         if ($raw === false || strlen($raw) > self::MAX_BODY_BYTES) throw new HttpError(413, '送信データが大きすぎます');
-        $value = json_decode($raw, true);
+        return $raw;
+    }
+
+    private function jsonInput(): array
+    {
+        $value = json_decode($this->rawInput(), true);
         if (!is_array($value)) throw new HttpError(400, '送信データが正しくありません');
         return $value;
     }
