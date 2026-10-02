@@ -45,6 +45,11 @@ PHPはすでに実行環境へ渡されている同名の環境変数を `home-p
 
 ## 本番反映
 
+Issue #12の修正版を反映する場合は、API配置前に
+`database/migrations/005_add_mutation_receipts.sql` を実行してください。
+初期導入でも `001_create_cloud_storage.sql` に続けて実行します。
+APIを先に更新してからフロントを配置し、[Issue #12の確認表](issue-12-release-checklist.md)で検証結果を記録します。
+
 1. ローカルで `npm ci && npm test && npm run build` を実行します。
 2. `dist/` の内容を `/home/f-taniguchi/www/shikode/www/tools/home-payment/` へ配置します。
 3. 上記のセッション設定を非公開の `home-payment.env` と、同名の設定がある実行環境へ反映します。

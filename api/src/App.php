@@ -22,7 +22,7 @@ final class App
             $app = new self();
             $app->dispatch();
         } catch (HttpError $error) {
-            self::json(['error' => $error->publicMessage], $error->status);
+            self::json(['error' => $error->publicMessage] + $error->details, $error->status);
         } catch (Throwable $error) {
             error_log('[home-payment] ' . $error->getMessage());
             self::json(['error' => 'サーバーでエラーが発生しました'], 500);
@@ -115,25 +115,25 @@ final class App
         } elseif ($method === 'GET' && $route === '/payments') {
             self::json(['payments' => $this->listPayments($session['user_id'])]);
         } elseif ($method === 'POST' && $route === '/payments') {
-            $this->createPayment($session['user_id']);
+            $this->mutation($session['user_id'], fn() => $this->createPayment($session['user_id']), 201);
         } elseif (preg_match('#^/payments/([0-9a-f-]{36})$#i', $route, $match)) {
-            if ($method === 'PATCH') $this->updatePayment($session['user_id'], $match[1]);
-            elseif ($method === 'DELETE') $this->deletePayment($session['user_id'], $match[1]);
+            if ($method === 'PATCH') $this->mutation($session['user_id'], fn() => $this->updatePayment($session['user_id'], $match[1]), 200);
+            elseif ($method === 'DELETE') $this->mutation($session['user_id'], fn() => $this->deletePayment($session['user_id'], $match[1]), 200);
             else throw new HttpError(405, '許可されていない操作です');
         } elseif ($method === 'GET' && $route === '/archive-batches') {
-            self::json(['archives' => $this->listArchives($session['user_id'])]);
+            self::json(['archives' => $this->snapshot(fn() => $this->listArchives($session['user_id']))]);
         } elseif ($method === 'POST' && $route === '/archive-batches/process') {
-            $this->processArchive($session['user_id']);
+            $this->mutation($session['user_id'], fn() => $this->processArchive($session['user_id']), 201);
         } elseif (preg_match('#^/archive-batches/([0-9a-f-]{36})/restore$#i', $route, $match) && $method === 'POST') {
-            $this->restoreArchive($session['user_id'], $match[1]);
+            $this->mutation($session['user_id'], fn() => $this->restoreArchive($session['user_id'], $match[1]), 200);
         } elseif (preg_match('#^/archive-batches/([0-9a-f-]{36})$#i', $route, $match) && $method === 'DELETE') {
-            $this->deleteArchive($session['user_id'], $match[1]);
+            $this->mutation($session['user_id'], fn() => $this->deleteArchive($session['user_id'], $match[1]), 200);
         } elseif ($route === '/settings' && $method === 'GET') {
             self::json(['settings' => $this->getSettings($session['user_id'])]);
         } elseif ($route === '/settings' && $method === 'PATCH') {
-            $this->updateSettings($session['user_id']);
+            $this->mutation($session['user_id'], fn() => $this->updateSettings($session['user_id']), 200);
         } elseif ($route === '/import/local' && $method === 'POST') {
-            $this->importLocal($session['user_id']);
+            $this->mutation($session['user_id'], fn() => $this->importLocal($session['user_id']), 200);
         } else {
             throw new HttpError(404, 'APIが見つかりません');
         }
@@ -617,11 +617,24 @@ final class App
 
     private function getState(string $userId): void
     {
-        self::json([
+        self::json($this->snapshot(fn() => [
             'payments' => $this->listPayments($userId),
             'archives' => $this->listArchives($userId),
             'settings' => $this->getSettings($userId),
-        ]);
+        ]));
+    }
+
+    private function snapshot(callable $read): array
+    {
+        $this->db->beginTransaction();
+        try {
+            $result = $read();
+            $this->db->commit();
+            return $result;
+        } catch (Throwable $error) {
+            if ($this->db->inTransaction()) $this->db->rollBack();
+            throw $error;
+        }
     }
 
     private function listPayments(string $userId): array
@@ -631,32 +644,63 @@ final class App
         return array_map(fn(array $row) => $this->paymentJson($row), $stmt->fetchAll());
     }
 
-    private function createPayment(string $userId): void
+    // The operation receipt and the data change commit together. Replaying a request
+    // after losing its response cannot apply the same edit or archive action twice.
+    private function mutation(string $userId, callable $action, int $status = 200): never
     {
-        $input = $this->jsonInput();
-        $payment = $this->validatePayment($input, false);
-        $id = self::uuid();
-        $now = self::now();
+        $operationId = (string)($_SERVER['HTTP_X_OPERATION_ID'] ?? '');
+        if ($operationId !== '' && !self::validUuid($operationId)) throw new HttpError(422, '操作IDが正しくありません');
+        $requestHash = hash('sha256', ($_SERVER['REQUEST_METHOD'] ?? '') . ':' . $this->routePath() . ':' . $this->rawInput());
+        $this->db->beginTransaction();
         try {
-            $stmt = $this->db->prepare(
-                'INSERT INTO payments
-                 (id,user_id,client_id,amount,memo,billing_target_type,billing_target_name,group_name,
-                  paid_at,created_at,updated_at,version,is_one_off)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
-            );
-            $stmt->execute([
-                $id, $userId, $payment['clientId'], $payment['amount'], $payment['memo'],
-                $payment['billingTargetType'], $payment['billingTargetName'], $payment['groupName'],
-                $payment['paidAt'], $now, $now, 1, $payment['isOneOff'] ? 1 : 0,
-            ]);
-        } catch (PDOException $error) {
-            if ($error->getCode() !== '23000') throw $error;
+            if ($operationId !== '') {
+                $this->db->prepare(
+                    'INSERT IGNORE INTO mutation_receipts (user_id,operation_id,request_hash,created_at) VALUES (?,?,?,UTC_TIMESTAMP(6))'
+                )->execute([$userId, $operationId, $requestHash]);
+                $receipt = $this->db->prepare('SELECT * FROM mutation_receipts WHERE user_id=? AND operation_id=? FOR UPDATE');
+                $receipt->execute([$userId, $operationId]);
+                $saved = $receipt->fetch();
+                if (!hash_equals($saved['request_hash'], $requestHash)) throw new HttpError(409, '同じ操作IDで異なる内容は送信できません');
+                if ($saved['response_json'] !== null) {
+                    $this->db->commit();
+                    self::json(json_decode($saved['response_json'], true, 512, JSON_THROW_ON_ERROR), (int)$saved['http_status']);
+                }
+            }
+            $body = $action();
+            if ($operationId !== '') {
+                $this->db->prepare('UPDATE mutation_receipts SET response_json=?,http_status=? WHERE user_id=? AND operation_id=?')
+                    ->execute([json_encode($body, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE), $status, $userId, $operationId]);
+            }
+            $this->db->commit();
+        } catch (Throwable $error) {
+            if ($this->db->inTransaction()) $this->db->rollBack();
+            if ($error instanceof PDOException && in_array((int)($error->errorInfo[1] ?? 0), [1205, 1213], true)) {
+                throw new HttpError(503, '同時に変更されています。もう一度同期してください');
+            }
+            throw $error;
         }
-        $row = $this->findPayment($userId, $payment['clientId']);
-        self::json(['payment' => $this->paymentJson($row)], 201);
+        self::json($body, $status);
     }
 
-    private function updatePayment(string $userId, string $id): void
+    private function createPayment(string $userId): array
+    {
+        $payment = $this->validatePayment($this->jsonInput(), false);
+        $existing = $this->findPayment($userId, $payment['clientId'], false);
+        if ($existing) return ['payment' => $this->paymentJson($existing)];
+        $now = self::now();
+        $this->db->prepare(
+            'INSERT INTO payments
+             (id,user_id,client_id,amount,memo,billing_target_type,billing_target_name,group_name,
+              paid_at,created_at,updated_at,version,is_one_off) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        )->execute([
+            self::uuid(), $userId, $payment['clientId'], $payment['amount'], $payment['memo'],
+            $payment['billingTargetType'], $payment['billingTargetName'], $payment['groupName'],
+            $payment['paidAt'], $now, $now, 1, $payment['isOneOff'] ? 1 : 0,
+        ]);
+        return ['payment' => $this->paymentJson($this->findPayment($userId, $payment['clientId']))];
+    }
+
+    private function updatePayment(string $userId, string $id): array
     {
         $input = $this->jsonInput();
         $payment = $this->validatePayment($input, true);
@@ -665,7 +709,7 @@ final class App
         $stmt = $this->db->prepare(
             'UPDATE payments SET amount=?,memo=?,billing_target_type=?,billing_target_name=?,group_name=?,
              paid_at=?,updated_at=UTC_TIMESTAMP(6),version=version+1,is_one_off=?
-             WHERE user_id=? AND (id=? OR client_id=?) AND deleted_at IS NULL AND version=?'
+             WHERE user_id=? AND (id=? OR client_id=?) AND deleted_at IS NULL AND processed_at IS NULL AND version=?'
         );
         $stmt->execute([
             $payment['amount'], $payment['memo'], $payment['billingTargetType'],
@@ -675,131 +719,130 @@ final class App
         if ($stmt->rowCount() !== 1) {
             $latest = $this->findPayment($userId, $id, false);
             if (!$latest) throw new HttpError(404, '支払い記録が見つかりません');
-            self::json(['error' => '別の端末で更新されています', 'payment' => $this->paymentJson($latest)], 409);
+            throw new HttpError(409, '別の端末で更新されています', ['payment' => $this->paymentJson($latest)]);
         }
-        self::json(['payment' => $this->paymentJson($this->findPayment($userId, $id))]);
+        return ['payment' => $this->paymentJson($this->findPayment($userId, $id))];
     }
 
-    private function deletePayment(string $userId, string $id): void
+    private function deletePayment(string $userId, string $id): array
     {
+        $version = filter_var($this->jsonInput()['version'] ?? null, FILTER_VALIDATE_INT);
+        if (!$version || $version < 1) throw new HttpError(422, '更新情報が不足しています');
         $stmt = $this->db->prepare(
             'UPDATE payments SET deleted_at=UTC_TIMESTAMP(6),updated_at=UTC_TIMESTAMP(6),version=version+1
-             WHERE user_id=? AND (id=? OR client_id=?) AND deleted_at IS NULL'
+             WHERE user_id=? AND (id=? OR client_id=?) AND deleted_at IS NULL AND processed_at IS NULL AND version=?'
         );
-        $stmt->execute([$userId, $id, $id]);
+        $stmt->execute([$userId, $id, $id, $version]);
         if ($stmt->rowCount() !== 1) {
-            $alreadyDeleted = $this->db->prepare(
-                'SELECT 1 FROM payments WHERE user_id=? AND (id=? OR client_id=?) AND deleted_at IS NOT NULL'
-            );
-            $alreadyDeleted->execute([$userId, $id, $id]);
-            if (!$alreadyDeleted->fetchColumn()) throw new HttpError(404, '支払い記録が見つかりません');
+            $deleted = $this->db->prepare('SELECT 1 FROM payments WHERE user_id=? AND (id=? OR client_id=?) AND deleted_at IS NOT NULL');
+            $deleted->execute([$userId, $id, $id]);
+            if (!$deleted->fetchColumn()) {
+                if (!$this->findPayment($userId, $id, false)) throw new HttpError(404, '支払い記録が見つかりません');
+                throw new HttpError(409, '別の端末で更新されています');
+            }
         }
-        self::json(['ok' => true]);
+        return ['ok' => true];
     }
 
-    private function processArchive(string $userId): void
+    private function processArchive(string $userId): array
     {
         $input = $this->jsonInput();
-        $requestedBatchId = (string)($input['clientBatchId'] ?? '');
-        if ($requestedBatchId !== '' && !self::validUuid($requestedBatchId)) throw new HttpError(422, '処理IDが正しくありません');
+        $batchId = (string)($input['clientBatchId'] ?? '');
+        if (!self::validUuid($batchId)) throw new HttpError(422, '処理IDが正しくありません');
         $group = self::cleanText((string)($input['groupName'] ?? ''), 255);
         [$type, $name] = $this->validateBilling($input['billingTargetType'] ?? '', $input['billingTargetName'] ?? null);
-        if ($type === 'self') throw new HttpError(422, '自分の支払いは処理対象にできません');
-        if ($group === '') throw new HttpError(422, 'まとまりが必要です');
-        $this->db->beginTransaction();
-        try {
-            $batchId = $requestedBatchId !== '' ? $requestedBatchId : self::uuid();
-            if ($requestedBatchId !== '') {
-                $existing = $this->db->prepare('SELECT id FROM archive_batches WHERE id=? AND user_id=?');
-                $existing->execute([$batchId, $userId]);
-                if ($existing->fetch()) {
-                    $this->db->rollBack();
-                    self::json(['archive' => $this->archiveById($userId, $batchId)]);
-                }
-            }
-            $condition = $name === null ? 'billing_target_name IS NULL' : 'billing_target_name=?';
-            $params = [$userId, $group, $type];
-            if ($name !== null) $params[] = $name;
-            $stmt = $this->db->prepare(
-                "SELECT id,amount FROM payments
-                 WHERE user_id=? AND group_name=? AND billing_target_type=? AND {$condition}
-                 AND processed_at IS NULL AND deleted_at IS NULL FOR UPDATE"
-            );
-            $stmt->execute($params);
-            $rows = $stmt->fetchAll();
-            if (!$rows) throw new HttpError(404, '処理する支払いが見つかりません');
-            $total = array_sum(array_map(fn(array $row) => (int)$row['amount'], $rows));
-            $now = self::now();
-            $this->db->prepare(
-                'INSERT INTO archive_batches
-                 (id,user_id,group_name,billing_target_type,billing_target_name,total_amount,item_count,processed_at,created_at)
-                 VALUES (?,?,?,?,?,?,?,?,?)'
-            )->execute([$batchId, $userId, $group, $type, $name, $total, count($rows), $now, $now]);
-            $update = $this->db->prepare('UPDATE payments SET processed_at=?,archive_batch_id=?,updated_at=? WHERE id=? AND user_id=?');
-            $link = $this->db->prepare('INSERT INTO archive_batch_payments (archive_batch_id,payment_id,user_id) VALUES (?,?,?)');
-            foreach ($rows as $row) {
-                $update->execute([$now, $batchId, $now, $row['id'], $userId]);
-                $link->execute([$batchId, $row['id'], $userId]);
-            }
-            $this->db->commit();
-            self::json(['archive' => $this->archiveById($userId, $batchId)], 201);
-        } catch (Throwable $error) {
-            if ($this->db->inTransaction()) $this->db->rollBack();
-            throw $error;
+        if ($type === 'self' || $group === '') throw new HttpError(422, '処理対象が正しくありません');
+        $selected = $input['payments'] ?? null;
+        if (!is_array($selected) || count($selected) === 0 || count($selected) > 500) throw new HttpError(422, '確認した支払いを指定してください');
+        $expected = [];
+        foreach ($selected as $item) {
+            $id = is_array($item) ? (string)($item['clientId'] ?? '') : '';
+            $version = is_array($item) ? filter_var($item['version'] ?? null, FILTER_VALIDATE_INT) : false;
+            if (!self::validUuid($id) || !$version || $version < 1 || isset($expected[$id])) throw new HttpError(422, '処理対象の更新情報が正しくありません');
+            $expected[$id] = $version;
         }
+        $existing = $this->db->prepare('SELECT id FROM archive_batches WHERE id=? AND user_id=? FOR UPDATE');
+        $existing->execute([$batchId, $userId]);
+        if ($existing->fetch()) throw new HttpError(409, 'この処理IDは使用済みです');
+        $placeholders = implode(',', array_fill(0, count($expected), '?'));
+        $stmt = $this->db->prepare("SELECT * FROM payments WHERE user_id=? AND client_id IN ({$placeholders}) ORDER BY id FOR UPDATE");
+        $stmt->execute(array_merge([$userId], array_keys($expected)));
+        $rows = $stmt->fetchAll();
+        if (count($rows) !== count($expected)) throw new HttpError(409, '処理対象が変更されています。確認し直してください');
+        foreach ($rows as $row) {
+            if ((int)$row['version'] !== $expected[$row['client_id']] || $row['processed_at'] !== null || $row['deleted_at'] !== null ||
+                $row['group_name'] !== $group || $row['billing_target_type'] !== $type || $row['billing_target_name'] !== $name) {
+                throw new HttpError(409, '処理対象が変更されています。確認し直してください');
+            }
+        }
+        $now = self::now();
+        $this->db->prepare(
+            'INSERT INTO archive_batches (id,user_id,group_name,billing_target_type,billing_target_name,total_amount,item_count,processed_at,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?)'
+        )->execute([$batchId, $userId, $group, $type, $name, array_sum(array_column($rows, 'amount')), count($rows), $now, $now]);
+        $update = $this->db->prepare('UPDATE payments SET processed_at=?,archive_batch_id=?,updated_at=?,version=version+1 WHERE id=? AND user_id=?');
+        $link = $this->db->prepare('INSERT INTO archive_batch_payments (archive_batch_id,payment_id,user_id) VALUES (?,?,?)');
+        foreach ($rows as $row) {
+            $update->execute([$now, $batchId, $now, $row['id'], $userId]);
+            $link->execute([$batchId, $row['id'], $userId]);
+        }
+        return ['archive' => $this->archiveById($userId, $batchId), 'payments' => $this->archivePaymentsJson($userId, $batchId)];
     }
 
-    private function restoreArchive(string $userId, string $batchId): void
+    private function lockArchivePayments(string $userId, array $batch): array
     {
-        $this->db->beginTransaction();
-        try {
-            $batch = $this->lockArchive($userId, $batchId);
-            if ($batch['restored_at'] !== null) throw new HttpError(409, 'すでに未処理へ戻されています');
-            $stmt = $this->db->prepare(
-                'UPDATE payments p JOIN archive_batch_payments ap ON ap.payment_id=p.id
-                 SET p.processed_at=NULL,p.archive_batch_id=NULL,p.updated_at=UTC_TIMESTAMP(6)
-                 WHERE ap.archive_batch_id=? AND ap.user_id=? AND p.user_id=?'
-            );
-            $stmt->execute([$batchId, $userId, $userId]);
-            $this->db->prepare('UPDATE archive_batches SET restored_at=UTC_TIMESTAMP(6) WHERE id=? AND user_id=?')->execute([$batchId, $userId]);
-            $this->db->commit();
-            self::json(['ok' => true]);
-        } catch (Throwable $error) {
-            if ($this->db->inTransaction()) $this->db->rollBack();
-            throw $error;
+        $stmt = $this->db->prepare(
+            'SELECT p.* FROM payments p JOIN archive_batch_payments ap ON ap.payment_id=p.id
+             WHERE ap.archive_batch_id=? AND ap.user_id=? AND p.user_id=? ORDER BY p.id FOR UPDATE'
+        );
+        $stmt->execute([$batch['id'], $userId, $userId]);
+        $rows = $stmt->fetchAll();
+        if (count($rows) !== (int)$batch['item_count']) throw new HttpError(409, 'アーカイブの対象が変更されています');
+        foreach ($rows as $row) {
+            if ($row['archive_batch_id'] !== $batch['id'] || $row['processed_at'] === null || $row['deleted_at'] !== null) {
+                throw new HttpError(409, 'アーカイブの対象が変更されています');
+            }
         }
+        return $rows;
     }
 
-    private function deleteArchive(string $userId, string $batchId): void
+    private function restoreArchive(string $userId, string $batchId): array
     {
-        $this->db->beginTransaction();
-        try {
-            $this->lockArchive($userId, $batchId);
-            $stmt = $this->db->prepare(
-                'DELETE p FROM payments p JOIN archive_batch_payments ap ON ap.payment_id=p.id
-                 WHERE ap.archive_batch_id=? AND ap.user_id=? AND p.user_id=?'
-            );
-            $stmt->execute([$batchId, $userId, $userId]);
-            $this->db->prepare('DELETE FROM archive_batches WHERE id=? AND user_id=?')->execute([$batchId, $userId]);
-            $this->db->commit();
-            self::json(['ok' => true]);
-        } catch (Throwable $error) {
-            if ($this->db->inTransaction()) $this->db->rollBack();
-            throw $error;
-        }
+        $batch = $this->lockArchive($userId, $batchId);
+        if ($batch['restored_at'] !== null) return ['ok' => true];
+        $rows = $this->lockArchivePayments($userId, $batch);
+        $update = $this->db->prepare('UPDATE payments SET processed_at=NULL,archive_batch_id=NULL,updated_at=UTC_TIMESTAMP(6),version=version+1 WHERE id=? AND user_id=? AND archive_batch_id=?');
+        foreach ($rows as $row) $update->execute([$row['id'], $userId, $batchId]);
+        $this->db->prepare('UPDATE archive_batches SET restored_at=UTC_TIMESTAMP(6) WHERE id=? AND user_id=?')->execute([$batchId, $userId]);
+        return ['ok' => true, 'payments' => $this->archivePaymentsJson($userId, $batchId)];
+    }
+
+    private function deleteArchive(string $userId, string $batchId): array
+    {
+        $batch = $this->lockArchive($userId, $batchId);
+        if ($batch['restored_at'] !== null) throw new HttpError(409, '未処理へ戻されたアーカイブは完全削除できません');
+        $rows = $this->lockArchivePayments($userId, $batch);
+        $delete = $this->db->prepare('DELETE FROM payments WHERE id=? AND user_id=? AND archive_batch_id=?');
+        foreach ($rows as $row) $delete->execute([$row['id'], $userId, $batchId]);
+        $this->db->prepare('DELETE FROM archive_batches WHERE id=? AND user_id=?')->execute([$batchId, $userId]);
+        return ['ok' => true];
     }
 
     private function listArchives(string $userId): array
     {
-        $stmt = $this->db->prepare(
-            'SELECT b.*,GROUP_CONCAT(p.client_id ORDER BY p.paid_at SEPARATOR ",") AS payment_ids
-             FROM archive_batches b
-             LEFT JOIN archive_batch_payments ap ON ap.archive_batch_id=b.id AND ap.user_id=b.user_id
-             LEFT JOIN payments p ON p.id=ap.payment_id AND p.user_id=b.user_id
-             WHERE b.user_id=? GROUP BY b.id ORDER BY b.processed_at DESC'
-        );
+        $stmt = $this->db->prepare('SELECT * FROM archive_batches WHERE user_id=? ORDER BY processed_at DESC');
         $stmt->execute([$userId]);
-        return array_map(fn(array $row) => $this->archiveJson($row), $stmt->fetchAll());
+        $batches = $stmt->fetchAll();
+        // Fetch rows rather than GROUP_CONCAT: even small batches can exceed 1024 bytes.
+        $links = $this->db->prepare(
+            'SELECT ap.archive_batch_id,p.client_id FROM archive_batch_payments ap
+             JOIN payments p ON p.id=ap.payment_id AND p.user_id=ap.user_id
+             WHERE ap.user_id=? ORDER BY p.paid_at,p.id'
+        );
+        $links->execute([$userId]);
+        $ids = [];
+        foreach ($links->fetchAll() as $row) $ids[$row['archive_batch_id']][] = $row['client_id'];
+        return array_map(fn($row) => $this->archiveJson($row + ['payment_ids' => $ids[$row['id']] ?? []]), $batches);
     }
 
     private function getSettings(string $userId): array
@@ -809,123 +852,108 @@ final class App
         $row = $stmt->fetch();
         if (!$row) {
             $now = self::now();
-            $this->db->prepare(
-                'INSERT INTO user_settings (user_id,current_group_name,default_billing_target_type,created_at,updated_at)
-                 VALUES (?,"日常生活","household",?,?)'
-            )->execute([$userId, $now, $now]);
+            $this->db->prepare('INSERT INTO user_settings (user_id,current_group_name,default_billing_target_type,created_at,updated_at) VALUES (?,"日常生活","household",?,?)')->execute([$userId, $now, $now]);
             return ['currentGroupName' => '日常生活', 'defaultBillingTargetType' => 'household', 'defaultBillingTargetName' => null];
         }
-        return [
-            'currentGroupName' => $row['current_group_name'],
-            'defaultBillingTargetType' => $row['default_billing_target_type'],
-            'defaultBillingTargetName' => $row['default_billing_target_name'],
-        ];
+        return ['currentGroupName' => $row['current_group_name'], 'defaultBillingTargetType' => $row['default_billing_target_type'], 'defaultBillingTargetName' => $row['default_billing_target_name']];
     }
 
-    private function updateSettings(string $userId): void
+    private function updateSettings(string $userId): array
     {
         $input = $this->jsonInput();
         $group = self::cleanText((string)($input['currentGroupName'] ?? '日常生活'), 255);
-        [$type, $name] = $this->validateBilling(
-            $input['defaultBillingTargetType'] ?? 'household',
-            $input['defaultBillingTargetName'] ?? null
-        );
-        $stmt = $this->db->prepare(
-            'INSERT INTO user_settings
-             (user_id,current_group_name,default_billing_target_type,default_billing_target_name,created_at,updated_at)
-             VALUES (?,?,?,?,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6))
-             ON DUPLICATE KEY UPDATE current_group_name=VALUES(current_group_name),
-             default_billing_target_type=VALUES(default_billing_target_type),
-             default_billing_target_name=VALUES(default_billing_target_name),updated_at=UTC_TIMESTAMP(6)'
-        );
-        $stmt->execute([$userId, $group ?: '未分類', $type, $name]);
-        self::json(['settings' => $this->getSettings($userId)]);
+        [$type, $name] = $this->validateBilling($input['defaultBillingTargetType'] ?? 'household', $input['defaultBillingTargetName'] ?? null);
+        $this->db->prepare(
+            'INSERT INTO user_settings (user_id,current_group_name,default_billing_target_type,default_billing_target_name,created_at,updated_at)
+             VALUES (?,?,?,?,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE current_group_name=VALUES(current_group_name),
+             default_billing_target_type=VALUES(default_billing_target_type),default_billing_target_name=VALUES(default_billing_target_name),updated_at=UTC_TIMESTAMP(6)'
+        )->execute([$userId, $group ?: '未分類', $type, $name]);
+        return ['settings' => $this->getSettings($userId)];
     }
 
-    private function importLocal(string $userId): void
+    private function importLocal(string $userId): array
     {
         $input = $this->jsonInput();
         $payments = is_array($input['payments'] ?? null) ? $input['payments'] : [];
         $archives = is_array($input['archives'] ?? null) ? $input['archives'] : [];
-        $groups = is_array($input['groups'] ?? null) ? $input['groups'] : [];
         if (count($payments) > 500 || count($archives) > 100) throw new HttpError(413, 'コピーできる件数の上限を超えています');
+        $source = (string)($input['importSourceId'] ?? 'legacy');
+        if (strlen($source) > 100) throw new HttpError(422, 'コピー元情報が正しくありません');
         $groupNames = [];
-        foreach ($groups as $group) {
+        foreach (($input['groups'] ?? []) as $group) {
             if (is_array($group) && isset($group['id'])) $groupNames[(string)$group['id']] = self::cleanText((string)($group['name'] ?? '未分類'), 255);
         }
-        $this->db->beginTransaction();
-        try {
-            foreach ($payments as $item) {
-                if (!is_array($item)) throw new HttpError(422, 'コピーするデータが正しくありません');
-                $clientId = self::validUuid((string)($item['id'] ?? '')) ? (string)$item['id'] : self::uuid();
-                $kind = ($item['kind'] ?? 'advance') === 'personal' ? 'personal' : 'advance';
-                $target = $kind === 'personal' ? ['self', null] : $this->legacyBilling($item['reimbursementTarget'] ?? null);
-                $group = $groupNames[(string)($item['groupId'] ?? '')] ?? '未分類';
-                $amount = filter_var($item['amount'] ?? null, FILTER_VALIDATE_INT);
-                if ($amount === false || $amount <= 0) throw new HttpError(422, 'コピーする金額が正しくありません');
-                $now = self::now();
-                $stmt = $this->db->prepare(
-                    'INSERT IGNORE INTO payments
-                     (id,user_id,client_id,amount,memo,billing_target_type,billing_target_name,group_name,
-                      paid_at,created_at,updated_at,processed_at,version,is_one_off)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)'
-                );
-                $stmt->execute([
-                    self::uuid(), $userId, $clientId, $amount,
-                    self::cleanText((string)($item['memo'] ?? ''), 2000),
-                    $target[0], $target[1], $group, $this->mysqlDate((string)($item['paidAt'] ?? '')),
-                    $this->mysqlDate((string)($item['createdAt'] ?? $now)), $now,
-                    isset($item['archivedAt']) ? $this->mysqlDate((string)$item['archivedAt']) : null,
-                    !empty($item['isOneOffGroup']) ? 1 : 0,
-                ]);
+        $ids = [];
+        $inserted = [];
+        foreach ($payments as $item) {
+            if (!is_array($item) || !is_string($item['id'] ?? null) || $item['id'] === '' || isset($ids[$item['id']])) throw new HttpError(422, 'コピーするデータが正しくありません');
+            $clientId = self::validUuid($item['id']) ? $item['id'] : self::uuidFromString('guest-payment:' . $userId . ':' . $source . ':' . $item['id']);
+            $ids[$item['id']] = $clientId;
+            $target = ($item['kind'] ?? '') === 'personal' ? ['self', null] : $this->legacyBilling($item['reimbursementTarget'] ?? null);
+            $payment = $this->validatePayment([
+                'clientId' => $clientId, 'amount' => $item['amount'] ?? null, 'memo' => $item['memo'] ?? '',
+                'billingTargetType' => $target[0], 'billingTargetName' => $target[1],
+                'groupName' => $groupNames[(string)($item['groupId'] ?? '')] ?? '未分類',
+                'paidAt' => $item['paidAt'] ?? '', 'isOneOff' => !empty($item['isOneOffGroup']),
+            ], false);
+            $stmt = $this->db->prepare(
+                'INSERT IGNORE INTO payments (id,user_id,client_id,amount,memo,billing_target_type,billing_target_name,group_name,paid_at,created_at,updated_at,version,is_one_off)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?)'
+            );
+            $stmt->execute([self::uuid(), $userId, $clientId, $payment['amount'], $payment['memo'], $target[0], $target[1], $payment['groupName'], $payment['paidAt'],
+                $this->mysqlDate((string)($item['createdAt'] ?? self::now())), self::now(), $payment['isOneOff'] ? 1 : 0]);
+            if ($stmt->rowCount() === 1) $inserted[$clientId] = $item;
+        }
+        $active = [];
+        foreach ($archives as $archive) {
+            if (!is_array($archive) || !is_string($archive['id'] ?? null) || !is_array($archive['paymentIds'] ?? null)) throw new HttpError(422, 'コピーする履歴が正しくありません');
+            $batchId = self::uuidFromString('guest-archive:' . $userId . ':' . $source . ':' . $archive['id']);
+            $members = [];
+            foreach ($archive['paymentIds'] as $oldId) {
+                if (!is_string($oldId) || !isset($ids[$oldId])) throw new HttpError(422, '履歴に対応する支払いが見つかりません');
+                $members[] = $ids[$oldId];
             }
-            foreach ($archives as $archive) {
-                if (!is_array($archive)) continue;
-                $sourceId = (string)($archive['id'] ?? '');
-                $batchId = self::validUuid($sourceId) ? $sourceId : self::uuid();
-                $paymentIds = array_values(array_filter($archive['paymentIds'] ?? [], fn($id) => is_string($id) && self::validUuid($id)));
-                if (!$paymentIds) continue;
-                $existing = $this->db->prepare('SELECT id FROM archive_batches WHERE id=? AND user_id=?');
-                $existing->execute([$batchId, $userId]);
-                if ($existing->fetch()) continue;
-                $target = $this->legacyBilling($archive['reimbursementTarget'] ?? null);
-                $group = $groupNames[(string)($archive['groupId'] ?? '')] ?? '未分類';
-                $placeholders = implode(',', array_fill(0, count($paymentIds), '?'));
-                $stmt = $this->db->prepare(
-                    "SELECT id,amount FROM payments WHERE user_id=? AND client_id IN ({$placeholders}) FOR UPDATE"
-                );
-                $stmt->execute(array_merge([$userId], $paymentIds));
-                $rows = $stmt->fetchAll();
-                if (!$rows) continue;
-                $processed = $this->mysqlDate((string)($archive['archivedAt'] ?? self::now()));
-                $total = array_sum(array_map(fn($row) => (int)$row['amount'], $rows));
-                $this->db->prepare(
-                    'INSERT INTO archive_batches
-                     (id,user_id,group_name,billing_target_type,billing_target_name,total_amount,item_count,processed_at,created_at,restored_at)
-                     VALUES (?,?,?,?,?,?,?,?,?,?)'
-                )->execute([
-                    $batchId, $userId, $group, $target[0] === 'self' ? 'unset' : $target[0], $target[1],
-                    $total, count($rows), $processed, $processed,
-                    isset($archive['restoredAt']) ? $this->mysqlDate((string)$archive['restoredAt']) : null,
-                ]);
-                foreach ($rows as $row) {
-                    $this->db->prepare('INSERT INTO archive_batch_payments (archive_batch_id,payment_id,user_id) VALUES (?,?,?)')
-                        ->execute([$batchId, $row['id'], $userId]);
-                    $this->db->prepare('UPDATE payments SET archive_batch_id=?,processed_at=? WHERE id=? AND user_id=?')
-                        ->execute([$batchId, $processed, $row['id'], $userId]);
+            $members = array_values(array_unique($members));
+            if (!$members) continue;
+            $processed = $this->mysqlDate((string)($archive['archivedAt'] ?? ''));
+            $restored = isset($archive['restoredAt']) ? $this->mysqlDate((string)$archive['restoredAt']) : null;
+            if ($restored === null) {
+                foreach ($members as $id) {
+                    if (isset($active[$id])) throw new HttpError(422, '支払いが複数の有効な履歴に含まれています');
+                    $active[$id] = ['batchId' => $batchId, 'sourceId' => $archive['id'], 'processed' => $processed];
                 }
             }
-            $settings = is_array($input['settings'] ?? null) ? $input['settings'] : [];
-            if (isset($settings['currentGroupName'])) {
-                $this->db->prepare('UPDATE user_settings SET current_group_name=?,updated_at=UTC_TIMESTAMP(6) WHERE user_id=?')
-                    ->execute([self::cleanText((string)$settings['currentGroupName'], 255), $userId]);
-            }
-            $this->db->commit();
-            self::json(['ok' => true, 'importedPayments' => count($payments)]);
-        } catch (Throwable $error) {
-            if ($this->db->inTransaction()) $this->db->rollBack();
-            throw $error;
+            $existing = $this->db->prepare('SELECT id FROM archive_batches WHERE id=? AND user_id=?');
+            $existing->execute([$batchId, $userId]);
+            if ($existing->fetch()) continue;
+            $placeholders = implode(',', array_fill(0, count($members), '?'));
+            $stmt = $this->db->prepare("SELECT id,amount FROM payments WHERE user_id=? AND client_id IN ({$placeholders}) ORDER BY id FOR UPDATE");
+            $stmt->execute(array_merge([$userId], $members));
+            $rows = $stmt->fetchAll();
+            if (count($rows) !== count($members)) throw new HttpError(409, 'コピー先の支払いが変更されています');
+            $target = $this->legacyBilling($archive['reimbursementTarget'] ?? null);
+            $total = filter_var($archive['totalAmount'] ?? array_sum(array_column($rows, 'amount')), FILTER_VALIDATE_INT);
+            if ($total === false || $total <= 0) throw new HttpError(422, '履歴の金額が正しくありません');
+            $this->db->prepare(
+                'INSERT INTO archive_batches (id,user_id,group_name,billing_target_type,billing_target_name,total_amount,item_count,processed_at,created_at,restored_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+            )->execute([$batchId, $userId, $groupNames[(string)($archive['groupId'] ?? '')] ?? '未分類', $target[0], $target[1],
+                $total, count($rows), $processed, $processed, $restored]);
+            foreach ($rows as $row) $this->db->prepare('INSERT INTO archive_batch_payments (archive_batch_id,payment_id,user_id) VALUES (?,?,?)')->execute([$batchId, $row['id'], $userId]);
         }
+        // Historical membership never determines the current payment state.
+        // On replay, existing payments may have been edited/restored since import.
+        foreach ($inserted as $id => $item) {
+            if (!isset($item['archivedAt'])) continue;
+            $batch = $active[$id] ?? null;
+            if (!$batch || ($item['archiveBatchId'] ?? null) !== $batch['sourceId']) throw new HttpError(422, '処理済み支払いに対応する有効な履歴がありません');
+            $this->db->prepare('UPDATE payments SET archive_batch_id=?,processed_at=? WHERE user_id=? AND client_id=?')->execute([$batch['batchId'], $batch['processed'], $userId, $id]);
+        }
+        $settings = is_array($input['settings'] ?? null) ? $input['settings'] : [];
+        if ($inserted && isset($settings['currentGroupName'])) {
+            $this->getSettings($userId);
+            $this->db->prepare('UPDATE user_settings SET current_group_name=?,updated_at=UTC_TIMESTAMP(6) WHERE user_id=?')->execute([self::cleanText((string)$settings['currentGroupName'], 255), $userId]);
+        }
+        return ['ok' => true, 'importedPayments' => count($inserted)];
     }
 
     private function validatePayment(array $input, bool $update): array
@@ -997,7 +1025,7 @@ final class App
             'groupName' => $row['group_name'],
             'billingTargetType' => $row['billing_target_type'],
             'billingTargetName' => $row['billing_target_name'],
-            'paymentIds' => $row['payment_ids'] ? explode(',', $row['payment_ids']) : [],
+            'paymentIds' => $row['payment_ids'],
             'totalAmount' => (int)$row['total_amount'],
             'itemCount' => (int)$row['item_count'],
             'processedAt' => $this->isoDate($row['processed_at']),
@@ -1023,17 +1051,21 @@ final class App
         return $row;
     }
 
+    private function archivePaymentsJson(string $userId, string $id): array
+    {
+        $stmt = $this->db->prepare('SELECT p.* FROM payments p JOIN archive_batch_payments ap ON ap.payment_id=p.id AND ap.user_id=p.user_id WHERE ap.archive_batch_id=? AND p.user_id=? ORDER BY p.paid_at,p.id');
+        $stmt->execute([$id, $userId]);
+        return array_map(fn($row) => $this->paymentJson($row), $stmt->fetchAll());
+    }
+
     private function archiveById(string $userId, string $id): array
     {
-        $stmt = $this->db->prepare(
-            'SELECT b.*,GROUP_CONCAT(p.client_id ORDER BY p.paid_at SEPARATOR ",") AS payment_ids
-             FROM archive_batches b
-             LEFT JOIN archive_batch_payments ap ON ap.archive_batch_id=b.id
-             LEFT JOIN payments p ON p.id=ap.payment_id
-             WHERE b.id=? AND b.user_id=? GROUP BY b.id'
-        );
+        $stmt = $this->db->prepare('SELECT * FROM archive_batches WHERE id=? AND user_id=?');
         $stmt->execute([$id, $userId]);
-        return $this->archiveJson($stmt->fetch());
+        $row = $stmt->fetch();
+        if (!$row) throw new HttpError(404, 'アーカイブが見つかりません');
+        $row['payment_ids'] = array_column($this->archivePaymentsJson($userId, $id), 'clientId');
+        return $this->archiveJson($row);
     }
 
     private function lineRequest(string $url, array $fields): array
@@ -1149,13 +1181,18 @@ final class App
         if (!$https) throw new HttpError(400, 'HTTPSでアクセスしてください');
     }
 
-    private function jsonInput(): array
+    private function rawInput(): string
     {
         $length = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
         if ($length > self::MAX_BODY_BYTES) throw new HttpError(413, '送信データが大きすぎます');
         $raw = file_get_contents('php://input', false, null, 0, self::MAX_BODY_BYTES + 1);
         if ($raw === false || strlen($raw) > self::MAX_BODY_BYTES) throw new HttpError(413, '送信データが大きすぎます');
-        $value = json_decode($raw, true);
+        return $raw;
+    }
+
+    private function jsonInput(): array
+    {
+        $value = json_decode($this->rawInput(), true);
         if (!is_array($value)) throw new HttpError(400, '送信データが正しくありません');
         return $value;
     }
@@ -1290,7 +1327,7 @@ final class App
 
 final class HttpError extends RuntimeException
 {
-    public function __construct(public int $status, public string $publicMessage)
+    public function __construct(public int $status, public string $publicMessage, public array $details = [])
     {
         parent::__construct($publicMessage);
     }

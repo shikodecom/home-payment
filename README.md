@@ -16,10 +16,24 @@ Vite + React + TypeScript のPWAです。未ログイン時は従来どおりブ
 ## 開発
 
 ```sh
+nvm use
 npm ci
 npm test
 npm run build
+npm run test:php
 ```
+
+Node.jsは `.nvmrc` の24.19.0、PHPは8.2以上を使います。依存はバージョンを固定し、更新時は `package.json` と `package-lock.json` を同時に更新します。
+PRとmain更新でフロント、PHP 8.2/8.3、MySQL 5.7/8.0のCIを実行します。
+
+実API・DBの回帰テストは、初期テーブルのない専用DBを作成して実行します。`DB_NAME` の末尾が `_test` でない場合は拒否します。テストはスキーマを作成し、専用ユーザーの試験データを作って終了時に削除します。
+
+```sh
+DB_HOST=127.0.0.1 DB_PORT=3306 DB_NAME=home_payment_test \
+  DB_USER=root DB_PASSWORD=your-test-password npm run test:mysql
+```
+
+同期の競合では未送信データを保持し、サーバーの内容を使うか、端末の編集を明示的に再適用するか選べます。取り消した変更は端末へバックアップし、アカウントメニューからJSONを保存できます。アーカイブ・削除など再適用できない操作は、サーバーの内容を確認して操作し直します。
 
 フロントの公開パスは `/tools/home-payment/`、APIは `/tools/home-payment/api/` です。PHP 8.2以上、PDO MySQL、cURL、mbstring、MySQL 5.7以上を想定しています。
 
@@ -38,6 +52,8 @@ npm run build
 - 初期SQL: `database/migrations/001_create_cloud_storage.sql`
 - 追加導入用SQL: `database/migrations/002_add_cloud_storage_to_existing_db.sql`
 - iPhoneホーム画面のログイン復帰追加: `database/migrations/004_add_pwa_login_resume.sql`
+- 安全な再送のための操作履歴: `database/migrations/005_add_mutation_receipts.sql`（新APIの配置前に実行）
+- Issue #12の反映と受け入れ確認: [リリース確認表](docs/issue-12-release-checklist.md)
 - 手動ロールバック: `database/rollback/001_remove_cloud_storage_manual.sql`
 
 秘密情報を公開ディレクトリやGitへ置かないでください。

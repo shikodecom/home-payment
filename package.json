@@ -1,1 +1,31 @@
-{"name":"home-payment","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite","build":"tsc -b && vite build","test":"vitest run","test:php":"php api/tests/security_static_test.php && php api/tests/session_test.php && php api/tests/line_message_parser_test.php","preview":"vite preview"},"dependencies":{"@vitejs/plugin-react":"latest","vite":"latest","typescript":"latest","react":"latest","react-dom":"latest","vite-plugin-pwa":"latest"},"devDependencies":{"@types/react":"latest","@types/react-dom":"latest","vitest":"latest"}}
+{
+  "name": "home-payment",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:php": "php api/tests/security_static_test.php && php api/tests/session_test.php && php api/tests/line_message_parser_test.php",
+    "preview": "vite preview",
+    "test:mysql": "php api/tests/mysql_integration_test.php"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.0.3",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "typescript": "7.0.2",
+    "vite": "8.1.4",
+    "vite-plugin-pwa": "1.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "jsdom": "30.1.1",
+    "vitest": "4.1.10"
+  },
+  "engines": {
+    "node": ">=24.19.0 <25"
+  }
+}

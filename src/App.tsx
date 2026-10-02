@@ -20,6 +20,7 @@ import {
 import type {ArchiveBatch, AuthState, BillingChoice, Payment, PaymentGroup, StoredData, SyncInfo} from './types'
 import {
   CloudPaymentRepository,
+  cancelPendingLogin,
   fetchAuthWithResume,
   guestImportWasHandled,
   loadGuestData,
@@ -76,6 +77,7 @@ export default function App() {
   const [importGuest, setImportGuest] = useState<StoredData | null>(null)
   const [accountOpen, setAccountOpen] = useState(false)
   const [manualSyncing, setManualSyncing] = useState(false)
+  const [resolvingSync, setResolvingSync] = useState(false)
   const [draft, setDraft] = useState<Draft>(blankDraft)
   const [editing, setEditing] = useState<string | null>(null)
   const [editDraft, setEditDraft] = useState<Draft | null>(null)
@@ -106,11 +108,11 @@ export default function App() {
       const repository: PaymentRepository = nextAuth.authenticated && nextAuth.user && nextAuth.csrfToken
         ? new CloudPaymentRepository(nextAuth.user.id, nextAuth.csrfToken)
         : new LocalPaymentRepository()
-      unsubscribeRef.current?.()
-      repositoryRef.current?.dispose()
-      unsubscribeRef.current = repository.subscribe(info => active && setSyncInfo(info))
-      repositoryRef.current = repository
       try {
+        unsubscribeRef.current?.()
+        repositoryRef.current?.dispose()
+        repositoryRef.current = repository
+        unsubscribeRef.current = repository.subscribe(info => active && setSyncInfo(info))
         const loaded = await repository.load()
         if (!active) return
         setData(loaded)
@@ -404,6 +406,21 @@ export default function App() {
     }
   }
 
+  const resolveSync = async (choice: 'server' | 'local') => {
+    const message = choice === 'server'
+      ? '競合した変更と、それに続く関連する変更を取り消して、サーバーの内容を使いますか？取り消す変更はこの端末にバックアップします。'
+      : '別の端末の変更を、この端末の編集内容で上書きしますか？'
+    if (!window.confirm(message)) return
+    setResolvingSync(true)
+    try {
+      const loaded = await repositoryRef.current?.resolveConflict?.(choice)
+      if (loaded) setData(loaded)
+      setNotice(choice === 'server' ? 'サーバーの内容を使いました。関連のない変更は引き続き同期します' : 'この端末の編集内容で保存を再試行しました')
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '変更の確認に失敗しました')
+    } finally { setResolvingSync(false) }
+  }
+
   const exportCsv = () => {
     const blob = new Blob([paymentCsv(data)], {type: 'text/csv;charset=utf-8'})
     const url = URL.createObjectURL(blob)
@@ -415,6 +432,17 @@ export default function App() {
     link.remove()
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
     setNotice(`${data.payments.length}件をCSVに保存しました`)
+  }
+
+  const exportBackup = () => {
+    const backup = repositoryRef.current?.exportBackup?.()
+    if (!backup) return
+    const url = URL.createObjectURL(new Blob([backup], {type: 'application/json'}))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `payment-backup-${new Date().toISOString().slice(0, 10)}.json`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
   const billingFields = (value: Draft, change: (next: Partial<Draft>) => void, allowUnset = false) => (
@@ -430,11 +458,13 @@ export default function App() {
   )
 
   const printTotal = filtered.reduce((total, payment) => total + payment.amount, 0)
+  if (resolvingSync) return <main><section className="panel" role="status"><h2>変更を確認しています…</h2><p>この端末のデータを保持して同期しています。</p></section></main>
   if (auth.status === 'checking' || auth.status === 'unavailable' || auth.pendingResume) {
     return <main><header className="hero"><div><p className="eyebrow">PAYMENT NOTE</p><h1>家計の支払めも</h1></div></header>
       <section className="panel auth-message" role="status">
         <h2>{auth.status === 'checking' ? 'ログイン状態を確認中…' : auth.pendingResume ? 'LINEログインの完了を待っています' : '認証状態を確認できません'}</h2>
-        {auth.status !== 'checking' && <><p>{notice || '通信を確認して再試行してください。'}</p><button className="primary" onClick={() => setAuthRetry(value => value + 1)}>再試行</button></>}
+        {auth.status !== 'checking' && <><p>{notice || '通信を確認して再試行してください。'}</p><button className="primary" onClick={() => setAuthRetry(value => value + 1)}>再試行</button>
+          {auth.pendingResume && <button onClick={() => { cancelPendingLogin(); setAuthRetry(value => value + 1) }}>ログインを取り消して戻る</button>}</>}
       </section></main>
   }
   return <>
@@ -460,6 +490,8 @@ export default function App() {
           {accountOpen && <div className="account-menu">
             <b>{auth.user.displayName}</b>
             <p>{syncInfo.message || (syncInfo.pendingCount ? `${syncInfo.pendingCount}件のデータが同期待ちです` : 'クラウドへ保存されています')}</p>
+            <button onClick={exportBackup}>端末データのバックアップを保存</button>
+            {syncInfo.state === 'failed' && !syncInfo.blocked && <button onClick={() => setAuthRetry(value => value + 1)}>ログイン状態を確認し直す</button>}
             <button className="logout-button" onClick={() => void logoutToGuest()}>ログアウト</button>
           </div>}
         </> : <>
@@ -471,6 +503,14 @@ export default function App() {
             }}>LINEでログイン</a>
         </>}
       </section>
+      {syncInfo.blocked && <section className="panel no-print" role="alert">
+        <h2>保存する変更の確認が必要です</h2>
+        <p>{syncInfo.blocked.message} この端末の未送信データは保持しています。</p>
+        {syncInfo.blocked.localMemo !== undefined && <p>この端末のメモ：{syncInfo.blocked.localMemo || '（なし）'}</p>}
+        {syncInfo.blocked.serverMemo !== undefined && <p>サーバーのメモ：{syncInfo.blocked.serverMemo || '（なし）'}</p>}
+        <button onClick={() => void resolveSync('server')}>競合した変更を取り消してサーバーの内容を使う</button>
+        {syncInfo.blocked.canReapply && <button onClick={() => void resolveSync('local')}>この端末の編集内容を保存する</button>}
+      </section>}
       {auth.user?.lineFriendAdded !== true &&
         <a className="line-friend-card no-print" href={lineOfficialAccountUrl} target="_blank" rel="noopener noreferrer">
           <span><small>LINE公式アカウント</small><b>旅と思考のデザイン</b></span>
